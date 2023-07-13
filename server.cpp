@@ -22,18 +22,22 @@ enum
     STATE_END = 2
 };
 
+
 struct Conn
 {
     int fd = -1;
     u_int32_t state = 0;
     // buffer for reading
     size_t rbuf_size = 0;
-    u_int8_t rbuf_size[4 + k_max_msg];
+    u_int8_t rbuf[4 + k_max_msg];
     // buffer for writing
     size_t wbuf_size = 0;
     size_t wbuf_sent = 0;
     u_int8_t wbuf[4 + k_max_msg];
 };
+
+static void state_req(Conn* conn);
+static void state_res(Conn* conn);
 
 static void msg(const char *msg)
 {
@@ -45,114 +49,6 @@ static void die(const char *msg)
     int err = errno;
     fprintf(stderr, "[%d] %s\n", err, msg);
     abort();
-}
-/**
- * Read N bytes from the file descriptor (i.e socket in this case)
- * and write to buffer
- */
-static int32_t read_full(int socketDescriptor, char *buf, size_t n)
-{
-    while (n > 0)
-    {
-        ssize_t rv = read(socketDescriptor, buf, n); // will return the number of bytes read
-        if (rv <= 0)
-        {
-            // if it's less than 0 it signifies some erro
-            // so return abruptly
-            return -1;
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv; // advancing the buffer with number of bytes read
-    }
-    return 0;
-}
-
-/**
- * Read N bytes from the buffer and write to file descriptor
- */
-static int32_t write_all(int sockerDescriptor, char *buf, size_t n)
-{
-    while (n > 0)
-    {
-        ssize_t rv = write(sockerDescriptor, buf, n);
-        if (rv <= 0)
-        {
-            return -1;
-        }
-        assert((size_t)rv <= n);
-        n -= (size_t)rv;
-        buf += rv;
-    }
-    return 0;
-}
-
-static void do_something(int connfd)
-{
-    char rbuf[4 + k_max_msg + 1];
-    ssize_t n = read(connfd, rbuf, sizeof(rbuf) - 1);
-    if (n < 0)
-    {
-        msg("read() error");
-        return;
-    }
-    printf("client says: %s\n", rbuf);
-
-    char wbuf[] = "world";
-    write(connfd, wbuf, strlen(wbuf));
-}
-
-static int32_t one_request(int socketFd)
-{
-    char rbuf[4 + k_max_msg + 1];
-    errno = 0;
-    int32_t err = read_full(socketFd, rbuf, 4);
-    if (err)
-    {
-        // encountered EOF without reading intended number of bytes
-        if (errno == 0)
-        {
-            msg("EOF");
-        }
-        else
-        {
-            msg("read() error");
-        }
-        return err;
-    }
-
-    uint32_t len = 0;
-    memcpy(&len, rbuf, 4);
-    if (len > k_max_msg)
-    {
-        msg("too long");
-        return -1;
-    }
-
-    // request body
-    err = read_full(socketFd, rbuf + 4, len);
-
-    if (err)
-    {
-        msg("read() error");
-        return err;
-    }
-
-    rbuf[4 + len] = '\0';
-    printf("Message Received :: %s\n", &rbuf[4]);
-
-    // replying
-
-    const char reply[] = "[ACK]";
-
-    char wbuf[4 + sizeof(reply)];
-
-    len = (uint32_t)strlen(reply);
-
-    memcpy(wbuf, &len, 4);
-    memcpy(wbuf + 4, reply, sizeof(reply));
-
-    return write_all(socketFd, wbuf, 4 + len);
 }
 
 /**
@@ -179,6 +75,158 @@ static void fd_set_nb(int fd)
         die("fcntl error");
     }
 }
+
+static bool try_one_request(Conn *conn) {
+    // trying to parse request from buffer
+    if(conn -> rbuf_size < 4) {
+        // even the lenght of the message isn't available,
+        // which is the first 4 bytes so returning false here
+        return false;
+    }
+    uint32_t len = 0;
+    memcpy(&len,conn->rbuf,4);
+    if(len > k_max_msg) {
+        msg("message too long");
+        conn->state = STATE_END;
+        return false;
+    }
+
+    if(4 + len > conn->rbuf_size) {
+        return false;
+    }
+
+    // got the message, print it out 
+    printf("client says: %.*s",len,conn->rbuf + 4);
+
+    // generating echo message 
+    memcpy(conn->wbuf,conn->rbuf,4);
+    memcpy(conn->wbuf + 4,conn->rbuf + 4,len);
+    conn->wbuf_size = 4 + len;
+
+    // remove the request from the buffer.
+    size_t remain = conn->rbuf_size - 4 - len;
+    if (remain) {
+        memmove(conn->rbuf, &conn->rbuf[4 + len], remain);
+    }
+    conn->rbuf_size = remain;
+
+    // change state
+    conn->state = STATE_RES;
+    // sending the response
+    state_res(conn);
+
+    return conn->state == STATE_REQ;
+}
+
+static bool try_fill_buffer(Conn *conn) {
+    assert(conn->rbuf_size < sizeof(conn->rbuf));
+    ssize_t rv = 0;
+    do {
+        size_t cap = sizeof(conn->rbuf) - conn->rbuf_size;
+        rv = read(conn->fd,conn->rbuf + conn->rbuf_size,cap);
+    } while(rv < 0 && errno == EINTR);
+    if(rv < 0 && errno == EAGAIN) {
+        // buffer was not filled, i.e no data was available.
+        return false;
+    }
+    if (rv < 0) {
+        msg("read() error");
+        conn->state = STATE_END;
+        return false;
+    }
+    if(rv == 0) {
+        // rv will be 0 when we amount of data read was 0.
+        if(conn->rbuf_size > 0) {
+            msg("Unexpected EOF");
+        } else {
+            msg("EOF");
+        }
+        conn->state = STATE_END;
+        return false;
+    }  
+
+    conn->rbuf_size += (size_t)rv;
+    assert(conn->rbuf_size <= sizeof(conn->rbuf));
+
+    // TODO: RESUME FROM HERE 
+
+    // Try to process requests one by one.
+    while (try_one_request(conn)) {}
+    return (conn->state == STATE_REQ);
+}
+
+static bool try_flush_buffer(Conn *conn) {
+    ssize_t rv = 0;
+    do {
+        size_t remain = conn->wbuf_size - conn->wbuf_sent;
+        rv = write(conn->fd,conn->wbuf + conn->wbuf_sent,remain);
+    } while(rv < 0 && errno == EINTR);
+    if(rv < 0 && errno == EAGAIN) {
+        return false;
+    }
+    if(rv < 0) {
+        msg("write() error");
+        conn->state = STATE_END;
+        return false;
+    }
+    conn->wbuf_sent += (size_t)rv;
+    assert(conn->wbuf_sent  <= conn->wbuf_size);
+    if(conn->wbuf_sent == conn->wbuf_size) {
+        conn->wbuf_size = 0;
+        conn->wbuf_sent = 0;
+        conn->state = STATE_REQ;
+        return false;
+    }
+    return true;
+}
+
+static void state_req(Conn *conn) {
+    while (try_fill_buffer(conn)) {}
+}
+static void state_res(Conn *conn) {
+    while (try_flush_buffer(conn)) {
+    }
+}
+
+static void connection_io(Conn *conn) {
+    if (conn->state == STATE_REQ) {
+        state_req(conn);
+    } else if (conn->state == STATE_RES) {
+        state_res(conn);
+    } else {
+        assert(0);  // not expected
+    }
+}
+
+static int32_t accept_new_conn(std::unordered_map<int, Conn *> &fd2Conn,int fd) {
+    printf("Accepting new connection \n");
+    // accept 
+    struct sockaddr_in client_addr;
+    socklen_t socklen  = sizeof(client_addr);
+    int connfd = accept(fd, (struct sockaddr *)&client_addr, &socklen);
+    if (connfd < 0) {
+        msg("accept() error");
+        return -1;  // error
+    }
+
+    // setting the new connections socket to non-blocking
+    fd_set_nb(connfd);
+
+    // creating the struct connection
+    struct Conn *conn = (struct Conn *)malloc(sizeof(struct Conn));
+    if(!conn) {
+        close(connfd);
+        return -1;
+    }
+    conn->fd = connfd;
+    conn->state = STATE_REQ;
+    conn->rbuf_size = 0;
+    conn->wbuf_size = 0;
+    conn->wbuf_sent = 0;
+    fd2Conn[connfd] = conn;
+    return 0;
+}
+
 
 int main()
 {
@@ -246,10 +294,7 @@ int main()
             {
                 continue;
             }
-
-            // Calling the poll function to wait for an event on any of the file descriptors in the poll_args vector.
-            // The third argument is the timeout, which is set to 1000 milliseconds.
-            // If no event occurs within the timeout, poll will return 0.
+        
             struct pollfd pfd = {};
             pfd.fd = conn->fd;
             pfd.events = (conn->state == STATE_REQ) ? POLLIN : POLLOUT;
@@ -257,6 +302,9 @@ int main()
             poll_args.push_back(pfd);
         }
 
+        // Calling the poll function to wait for an event on any of the file descriptors in the poll_args vector.
+        // The third argument is the timeout, which is set to 1000 milliseconds.
+        // If no event occurs within the timeout, poll will return 0.
         // polling for active fd's and if there are no active fd's with the timeout specified,
         // i.e 1000ms then it will return an error
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), 1000);
@@ -272,8 +320,9 @@ int main()
             // the corresponding fd is ready for an io
             if (poll_args[i].revents)
             {
+                printf("Connection ready for io");
                 Conn *conn = fd2Conn[poll_args[i].fd];
-                // connection_io(conn); //TODO: performing the io
+                connection_io(conn); //TODO: performing the io
                 if (conn->state == STATE_END){
                     // client closed normally, or something bad happened.
                     // destroy this connection
@@ -282,12 +331,11 @@ int main()
                     free(conn);
                 }
             }
-
-            // try to accept a new connection if the listening fd is active
-            if (poll_args[0].revents)
-            {
-                // accept_new_conn(fd2conn, fd);
-            }
+        }
+        // try to accept a new connection if the listening fd is active
+        if (poll_args[0].revents)
+        {
+            accept_new_conn(fd2Conn, serverSocket);
         }
     }
 
